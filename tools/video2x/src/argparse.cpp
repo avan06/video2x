@@ -80,6 +80,8 @@ int parse_args(
                 "Input video file path")
             ("output,o", PO_STR_VALUE<video2x::fsutils::StringType>(),
                 "Output video file path (if not specified, the input file name will be used by default)")
+            ("suffix", PO_STR_VALUE<video2x::fsutils::StringType>(),
+                "If a value is provided, the output file name will include a suffix")
             ("processor,p", PO_STR_VALUE<video2x::fsutils::StringType>()->required(),
                 "Processor to use (libplacebo, realesrgan, realcugan, rife)")
             ("hwaccel,a", PO_STR_VALUE<video2x::fsutils::StringType>()
@@ -270,6 +272,18 @@ int parse_args(
         } else {
             arguments.out_fname = arguments.in_fname.filename();  // Extract file name only
         }
+
+        if (vm.count("suffix")) {
+            std::string extension = arguments.out_fname.extension().u8string();
+            // Replace with your desired suffix
+            std::filesystem::path suffix =
+                std::filesystem::path(vm["suffix"].as<video2x::fsutils::StringType>());
+            // Combine stem, suffix, and extension
+            arguments.out_fname = arguments.out_fname.stem();
+            arguments.out_fname += suffix;
+            arguments.out_fname += extension;
+        }
+        video2x::logger()->info("Output name: {}", arguments.out_fname.u8string());
 
         // Parse processor type
         if (vm.count("processor")) {
