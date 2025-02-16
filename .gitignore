@@ -75,3 +75,12 @@ compile_commands.json
 CTestTestfile.cmake
 _deps
 CMakeUserPresets.json
+
+# third_party shared directory
+third_party/ffmpeg-shared/
+third_party/ncnn-shared/
+
+# Visual Studio
+.vs
+out/build/
+out/install/
