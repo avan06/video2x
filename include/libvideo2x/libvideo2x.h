@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <future>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -67,9 +68,8 @@ class LIBVIDEO2X_API VideoProcessor {
 
     [[nodiscard]] inline int process_filtering(
         std::unique_ptr<processors::Processor>& processor,
-        encoder::Encoder& encoder,
         AVFrame* frame,
-        AVFrame* proc_frame
+        std::promise<std::unique_ptr<AVFrame, decltype(&avutils::av_frame_deleter)>>& promise
     );
 
     [[nodiscard]] inline int process_interpolation(
@@ -78,6 +78,14 @@ class LIBVIDEO2X_API VideoProcessor {
         std::unique_ptr<AVFrame, decltype(&avutils::av_frame_deleter)>& prev_frame,
         AVFrame* frame,
         AVFrame* proc_frame
+    );
+
+    [[nodiscard]] int process_frame_batch(
+        std::unique_ptr<processors::Processor>& processor,
+        encoder::Encoder& encoder,
+        std::vector<std::unique_ptr<AVFrame, decltype(&avutils::av_frame_deleter)>>& frame_batch,
+        std::unique_ptr<AVFrame, decltype(&avutils::av_frame_deleter)>& prev_frame,
+        AVCodecContext* enc_ctx  // Pass encoder context as a parameter
     );
 
     processors::ProcessorConfig proc_cfg_;

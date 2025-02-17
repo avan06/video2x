@@ -6,6 +6,8 @@ extern "C" {
 }
 
 #include <spdlog/spdlog.h>
+#include <future>  // for std::async
+#include <vector>
 
 #include "avutils.h"
 #include "decoder.h"
@@ -196,13 +198,31 @@ int VideoProcessor::process_frames(
         total_frames_.store(total_frames_.load() * proc_cfg_.frm_rate_mul);
     }
 
+    const int batch_size = 50; // Define batch size (e.g., 4)
+    std::vector<std::unique_ptr<AVFrame, decltype(&avutils::av_frame_deleter)>> frame_batch;
+    frame_batch.reserve(batch_size);  // Pre-allocate memory for efficiency
+
     // Read frames from the input file
     while (state_.load() != VideoProcessorState::Aborted) {
         ret = av_read_frame(ifmt_ctx, packet.get());
         if (ret < 0) {
             if (ret == AVERROR_EOF) {
                 logger()->debug("Reached end of file");
-                break;
+                // If there are remaining frames in batch, process them
+                if (!frame_batch.empty()) {
+                    logger()->debug(
+                        "Processing remaining {} frames before exiting", frame_batch.size()
+                    );
+                    ret = process_frame_batch(processor, encoder, frame_batch, prev_frame, enc_ctx);
+                    if (ret < 0) {
+                        av_strerror(ret, errbuf, sizeof(errbuf));
+                        logger()->critical("Error processing frame batch: {}", errbuf);
+                        return ret;
+                    }
+                    frame_batch.clear();
+                    logger()->debug("Processed frame {}/{}", frame_idx_.load(), total_frames_.load());
+                }
+                break;  // Exit loop after processing remaining frames
             }
             av_strerror(ret, errbuf, sizeof(errbuf));
             logger()->critical("Error reading packet: {}", errbuf);
@@ -241,29 +261,19 @@ int VideoProcessor::process_frames(
                 frame->pts =
                     av_rescale_q(frame_idx_, av_inv_q(enc_ctx->framerate), enc_ctx->time_base);
 
-                // Process the frame based on the selected processing mode
-                AVFrame* proc_frame = nullptr;
-                switch (processor->get_processing_mode()) {
-                    case processors::ProcessingMode::Filter: {
-                        ret = process_filtering(processor, encoder, frame.get(), proc_frame);
-                        break;
+                // Add the frame to batch
+                frame_batch.emplace_back(av_frame_clone(frame.get()), &avutils::av_frame_deleter);
+                if (frame_batch.size() >= batch_size) {
+                    // Process batch when batch size reaches the threshold
+                    ret = process_frame_batch(processor, encoder, frame_batch, prev_frame, enc_ctx);
+                    if (ret < 0) {
+                        av_strerror(ret, errbuf, sizeof(errbuf));
+                        logger()->critical("Error processing frame batch: {}", errbuf);
+                        return ret;
                     }
-                    case processors::ProcessingMode::Interpolate: {
-                        ret = process_interpolation(
-                            processor, encoder, prev_frame, frame.get(), proc_frame
-                        );
-                        break;
-                    }
-                    default:
-                        logger()->critical("Unknown processing mode");
-                        return -1;
+                    frame_batch.clear();
+                    logger()->debug("Processed frame {}/{}", frame_idx_.load(), total_frames_.load());
                 }
-                if (ret < 0 && ret != AVERROR(EAGAIN)) {
-                    return ret;
-                }
-                av_frame_unref(frame.get());
-                frame_idx_.fetch_add(1);
-                logger()->debug("Processed frame {}/{}", frame_idx_.load(), total_frames_.load());
             }
         } else if (enc_cfg_.copy_streams && stream_map[packet->stream_index] >= 0) {
             ret = write_raw_packet(packet.get(), ifmt_ctx, ofmt_ctx, stream_map);
@@ -349,9 +359,8 @@ int VideoProcessor::write_raw_packet(
 
 int VideoProcessor::process_filtering(
     std::unique_ptr<processors::Processor>& processor,
-    encoder::Encoder& encoder,
     AVFrame* frame,
-    AVFrame* proc_frame
+    std::promise<std::unique_ptr<AVFrame, decltype(&avutils::av_frame_deleter)>>& promise
 ) {
     char errbuf[AV_ERROR_MAX_STRING_SIZE];
     int ret = 0;
@@ -360,18 +369,25 @@ int VideoProcessor::process_filtering(
     processors::Filter* filter = static_cast<processors::Filter*>(processor.get());
 
     // Process the frame using the filter
+    AVFrame* proc_frame = nullptr;
     ret = filter->filter(frame, &proc_frame);
 
-    // Write the processed frame
+    // Handle filtering error
     if (ret < 0 && ret != AVERROR(EAGAIN)) {
         av_strerror(ret, errbuf, sizeof(errbuf));
         logger()->critical("Error filtering frame: {}", errbuf);
+
+        // Ensure promise receives a valid std::unique_ptr instead of nullptr
+        promise.set_value(std::unique_ptr<AVFrame, decltype(&avutils::av_frame_deleter)>(
+            nullptr, &avutils::av_frame_deleter
+        ));
     } else if (ret == 0 && proc_frame != nullptr) {
-        auto processed_frame = std::unique_ptr<AVFrame, decltype(&avutils::av_frame_deleter)>(
+        // Store the processed frame in promise for later writing
+        promise.set_value(std::unique_ptr<AVFrame, decltype(&avutils::av_frame_deleter)>(
             proc_frame, &avutils::av_frame_deleter
-        );
-        ret = write_frame(processed_frame.get(), encoder);
+        ));
     }
+
     return ret;
 }
 
@@ -448,5 +464,72 @@ int VideoProcessor::process_interpolation(
     prev_frame.reset(av_frame_clone(frame));
     return ret;
 }
+
+int VideoProcessor::process_frame_batch(
+    std::unique_ptr<processors::Processor>& processor,
+    encoder::Encoder& encoder,
+    std::vector<std::unique_ptr<AVFrame, decltype(&avutils::av_frame_deleter)>>& frame_batch,
+    std::unique_ptr<AVFrame, decltype(&avutils::av_frame_deleter)>& prev_frame,
+    AVCodecContext* enc_ctx
+) {
+    int ret = 0;
+    std::vector<std::promise<std::unique_ptr<AVFrame, decltype(&avutils::av_frame_deleter)>>>
+        processed_frames(frame_batch.size());
+    std::vector<std::future<std::unique_ptr<AVFrame, decltype(&avutils::av_frame_deleter)>>>
+        processed_futures;
+
+    for (size_t i = 0; i < frame_batch.size(); i++) {
+        // Process the frame based on the selected processing mode
+        switch (processor->get_processing_mode()) {
+            case processors::ProcessingMode::Filter: {
+                processed_futures.push_back(processed_frames[i].get_future());
+                // Launch filtering asynchronously, store the result in a promise to maintain order
+                std::async(
+                    std::launch::async,
+                    &VideoProcessor::process_filtering,
+                    this,
+                    std::ref(processor),
+                    frame_batch[i].get(),
+                    std::ref(processed_frames[i])
+                );
+                break;
+            }
+            case processors::ProcessingMode::Interpolate: {
+                AVFrame* proc_frame = nullptr;
+                ret = process_interpolation(
+                    processor, encoder, prev_frame, frame_batch[i].get(), proc_frame
+                );
+                if (ret < 0) {
+                    return ret;  // Interpolation must remain synchronous
+                }
+                frame_idx_.fetch_add(1);
+                break;
+            }
+            default:
+                logger()->critical("Unknown processing mode");
+                return -1;
+        }
+    }
+
+    // Wait for all filtering tasks to complete
+    if (processor->get_processing_mode() == processors::ProcessingMode::Filter) {
+        for (size_t i = 0; i < frame_batch.size(); i++) {
+            auto processed_frame = processed_futures[i].get();
+            if (processed_frame) {
+                ret = write_frame(processed_frame.get(), encoder);
+                if (ret < 0) {
+                    return ret;
+                }
+                frame_idx_.fetch_add(1);
+
+                // Release frame memory to avoid memory leaks
+                av_frame_unref(frame_batch[i].get());
+            }
+        }
+    }
+
+    return 0;
+}
+
 
 }  // namespace video2x
