@@ -78,12 +78,12 @@ int VideoProcessor::process(
     int in_vstream_idx = decoder.get_video_stream_index();
 
     // Create and initialize the appropriate filter
-    std::unique_ptr<processors::Processor> processor(
-        processors::ProcessorFactory::instance().create_processor(proc_cfg_, vk_device_idx_)
-    );
-    if (processor == nullptr) {
+    std::vector<std::unique_ptr<processors::Processor>> processors =
+        processors::ProcessorFactory::instance().create_processor(proc_cfg_, vk_device_idx_);
+    if (processors.empty()) {
         return handle_error(-1, "Failed to create filter instance");
     }
+    std::unique_ptr<processors::Processor> processor = std::move(processors[0]);
 
     // Initialize output dimensions based on filter configuration
     int output_width = 0, output_height = 0;
@@ -117,8 +117,19 @@ int VideoProcessor::process(
         return handle_error(ret, "Failed to initialize filter");
     }
 
+    std::unique_ptr<processors::Processor> processor_rife;
+    if (processors.size() > 1) {
+        processor_rife = std::move(processors[1]);
+
+        // Initialize the Interpolator
+        ret = processor_rife->init(dec_ctx, encoder.get_encoder_context(), hw_ctx.get());
+        if (ret < 0) {
+            return handle_error(ret, "Failed to initialize Interpolator");
+        }
+    }
+
     // Process frames using the encoder and decoder
-    ret = process_frames(decoder, encoder, processor);
+    ret = process_frames(decoder, encoder, processor, processor_rife);
     if (ret < 0) {
         return handle_error(ret, "Error processing frames");
     }
@@ -143,7 +154,8 @@ int VideoProcessor::process(
 int VideoProcessor::process_frames(
     decoder::Decoder& decoder,
     encoder::Encoder& encoder,
-    std::unique_ptr<processors::Processor>& processor
+    std::unique_ptr<processors::Processor>& processor,
+    std::unique_ptr<processors::Processor>& processor_rife
 ) {
     char errbuf[AV_ERROR_MAX_STRING_SIZE];
     int ret = 0;
@@ -196,11 +208,26 @@ int VideoProcessor::process_frames(
         total_frames_.store(total_frames_.load() * proc_cfg_.frm_rate_mul);
     }
 
+    std::vector<std::unique_ptr<AVFrame, decltype(&avutils::av_frame_deleter)>> frames;
+    frames.reserve(10);
+
     // Read frames from the input file
     while (state_.load() != VideoProcessorState::Aborted) {
         ret = av_read_frame(ifmt_ctx, packet.get());
         if (ret < 0) {
             if (ret == AVERROR_EOF) {
+                // If there are remaining frames in batch, process them
+                if (!frames.empty()) {
+                    logger()->debug("Processing remaining {} frames before exiting", frames.size());
+                    for (auto& frame : frames) {
+                        AVFrame* proc_frame = nullptr;
+                        ret = process_filtering(processor, encoder, frame.get(), proc_frame);
+                        if (ret < 0) {
+                            return ret;
+                        }
+                    }
+                    frames.clear();
+                }
                 logger()->debug("Reached end of file");
                 break;
             }
@@ -245,7 +272,20 @@ int VideoProcessor::process_frames(
                 AVFrame* proc_frame = nullptr;
                 switch (processor->get_processing_mode()) {
                     case processors::ProcessingMode::Filter: {
-                        ret = process_filtering(processor, encoder, frame.get(), proc_frame);
+                        if (processor_rife) {
+                            // When executing the Filter, if a RIFE processor exists, it indicates that the upscale process should be performed using the skip-frame interpolation method.
+                            frames.emplace_back(av_frame_clone(frame.get()), &avutils::av_frame_deleter);
+                            if (frames.size() < proc_cfg_.upscale_skip_interval + 2) {
+                                // Here, the frame is emplaced back into frames. To ensure the correct calculation of frame->pts, the frame_idx_ value needs to be fetch_add.
+                                // This value will be subtracted later during processing and will only be officially fetch_add again after write_frame.
+                                frame_idx_.fetch_add(1);
+                                continue;
+                            }
+                            ret = process_filter_interpolate(processor, processor_rife, encoder, frames, prev_frame);
+                            frames.clear();
+                        } else {
+                            ret = process_filtering(processor, encoder, frame.get(), proc_frame);
+                        }
                         break;
                     }
                     case processors::ProcessingMode::Interpolate: {
@@ -446,6 +486,111 @@ int VideoProcessor::process_interpolation(
 
     // Update the previous frame with the current frame
     prev_frame.reset(av_frame_clone(frame));
+    return ret;
+}
+
+int VideoProcessor::process_filter_interpolate(
+    std::unique_ptr<processors::Processor>& processor,
+    std::unique_ptr<processors::Processor>& processor_rife,
+    encoder::Encoder& encoder,
+    std::vector<std::unique_ptr<AVFrame, decltype(&avutils::av_frame_deleter)>>& frames,
+    std::unique_ptr<AVFrame, decltype(&avutils::av_frame_deleter)>& prev_frame
+) {
+    char errbuf[AV_ERROR_MAX_STRING_SIZE];
+    int ret = 0;
+    int frame_count = proc_cfg_.upscale_skip_interval + 2;
+
+    processors::Filter* filter = static_cast<processors::Filter*>(processor.get());
+    processors::Interpolator* interpolator = static_cast<processors::Interpolator*>(processor_rife.get());
+
+    if (frames.size() < frame_count) {
+        logger()->critical("Not enough frames for processing, frames.size(): {}, frame_count: {}", frames.size(), frame_count);
+        return -1;
+    }
+
+    // Previously, when emplacing the frame into frames, frame_idx_ was temporarily fetch-added to ensure the correctness of frame->pts. Now, it is decremented.
+    frame_idx_.fetch_sub(frame_count - 1);
+
+    AVCodecContext* enc_ctx = encoder.get_encoder_context();
+    float time_step = 1.0f / static_cast<float>(frame_count - 1);
+
+    // Check for scene change
+    bool scene_change = false;
+    if (proc_cfg_.scn_det_thresh < 100.0 && prev_frame) {
+        float frame_diff = avutils::get_frame_diff(prev_frame.get(), frames.back().get());
+        if (frame_diff > proc_cfg_.scn_det_thresh) {
+            logger()->debug("Scene change detected ({:.2f}%)", frame_diff);
+            scene_change = true;
+        }
+    }
+
+    // Create storage for processed frames
+    std::vector<std::unique_ptr<AVFrame, decltype(&avutils::av_frame_deleter)>> proc_frames;
+    proc_frames.reserve(frame_count);
+    for (int i = 0; i < frame_count; i++) {
+        proc_frames.emplace_back(nullptr, avutils::av_frame_deleter);
+    }
+
+    // Apply filter only on first and last frame
+    for (int i = 0; i < frame_count; i++) {
+        if (i == 0 || i == frame_count - 1 || scene_change) {
+            // Temporary pointer to store the filtered frame
+            AVFrame* raw_proc_frame = nullptr;
+            // Apply the filter to the frame
+            ret = filter->filter(frames[i].get(), &raw_proc_frame);
+            if (ret < 0) {
+                av_strerror(ret, errbuf, sizeof(errbuf));
+                logger()->critical("Error filtering frame: {}", errbuf);
+                return ret;
+            }
+            // If filtering is successful, assign ownership to unique_ptr
+            if (raw_proc_frame) {
+                proc_frames[i].reset(raw_proc_frame);
+                proc_frames[i]->pts = frames[i]->pts;  // Maintain original PTS
+            }
+        }
+    }
+
+    // Interpolate intermediate frames if no scene change
+    if (!scene_change) {
+        for (int i = 1; i < frame_count - 1; i++) {
+            float interp_step = time_step * i;
+            AVFrame* raw_interp_frame = nullptr;  // Temporary pointer for the interpolated frame
+
+            // Perform interpolation
+            ret = interpolator->interpolate(
+                proc_frames.front().get(),  // First filtered frame
+                proc_frames.back().get(),   // Last filtered frame
+                &raw_interp_frame,          // Store the interpolated frame in a raw pointer
+                interp_step
+            );
+
+            if (ret < 0) {
+                av_strerror(ret, errbuf, sizeof(errbuf));
+                logger()->critical("Error interpolating frame: {}", errbuf);
+                return ret;
+            }
+
+            if (raw_interp_frame) {
+                proc_frames[i].reset(raw_interp_frame);
+                proc_frames[i]->pts = frames[i]->pts;
+            }
+        }
+    }
+
+    // Write frames
+    for (int i = 0; i < proc_frames.size(); i++) {
+        if (proc_frames[i]) {
+            ret = write_frame(proc_frames[i].get(), encoder);
+            if (ret < 0) {
+                return ret;
+            }
+            if (i < proc_frames.size() - 1)
+                frame_idx_.fetch_add(1);
+        }
+    }
+
+    prev_frame.reset(av_frame_clone(frames.back().get()));
     return ret;
 }
 
