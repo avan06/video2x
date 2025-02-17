@@ -53,7 +53,8 @@ class LIBVIDEO2X_API VideoProcessor {
     [[nodiscard]] int process_frames(
         decoder::Decoder& decoder,
         encoder::Encoder& encoder,
-        std::unique_ptr<processors::Processor>& processor
+        std::unique_ptr<processors::Processor>& processor,
+        std::unique_ptr<processors::Processor>& processor_rife
     );
 
     [[nodiscard]] int write_frame(AVFrame* frame, encoder::Encoder& encoder);
@@ -68,7 +69,7 @@ class LIBVIDEO2X_API VideoProcessor {
     [[nodiscard]] inline int process_filtering(
         std::unique_ptr<processors::Processor>& processor,
         encoder::Encoder& encoder,
-        AVFrame* frame,
+        std::vector<std::unique_ptr<AVFrame, decltype(&avutils::av_frame_deleter)>>& frames,
         AVFrame* proc_frame
     );
 
@@ -79,6 +80,18 @@ class LIBVIDEO2X_API VideoProcessor {
         AVFrame* frame,
         AVFrame* proc_frame
     );
+
+    [[nodiscard]] inline int process_filter_interpolate(
+        std::unique_ptr<processors::Processor>& processor,
+        std::unique_ptr<processors::Processor>& processor_rife,
+        encoder::Encoder& encoder,
+        std::vector<std::unique_ptr<AVFrame, decltype(&avutils::av_frame_deleter)>>& frames
+    );
+
+    [[nodiscard]] inline std::pair<std::vector<std::unique_ptr<AVFrame, decltype(&avutils::av_frame_deleter)>>, int> 
+    merge_frames(const std::vector<std::unique_ptr<AVFrame, decltype(&avutils::av_frame_deleter)>>& frames, int merge_count);
+
+    [[nodiscard]] inline std::vector<std::unique_ptr<AVFrame, decltype(&avutils::av_frame_deleter)>> split_frame(AVFrame* frame, int split_count);
 
     processors::ProcessorConfig proc_cfg_;
     encoder::EncoderConfig enc_cfg_;

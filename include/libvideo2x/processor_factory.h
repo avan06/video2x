@@ -12,7 +12,7 @@ namespace processors {
 // Processor Factory Class
 class ProcessorFactory {
    public:
-    using Creator = std::function<std::unique_ptr<Processor>(const ProcessorConfig&, uint32_t)>;
+    using Creator = std::function<std::vector<std::unique_ptr<Processor>>(const ProcessorConfig&, uint32_t)>;
 
     // Singleton instance accessor
     static ProcessorFactory& instance();
@@ -21,7 +21,7 @@ class ProcessorFactory {
     void register_processor(ProcessorType type, Creator creator);
 
     // Create a processor instance based on configuration
-    std::unique_ptr<Processor>
+    std::vector<std::unique_ptr<Processor>>
     create_processor(const ProcessorConfig& proc_cfg, uint32_t vk_device_index) const;
 
    private:

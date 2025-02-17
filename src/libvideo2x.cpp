@@ -78,12 +78,12 @@ int VideoProcessor::process(
     int in_vstream_idx = decoder.get_video_stream_index();
 
     // Create and initialize the appropriate filter
-    std::unique_ptr<processors::Processor> processor(
-        processors::ProcessorFactory::instance().create_processor(proc_cfg_, vk_device_idx_)
-    );
-    if (processor == nullptr) {
+    std::vector<std::unique_ptr<processors::Processor>> processors =
+        processors::ProcessorFactory::instance().create_processor(proc_cfg_, vk_device_idx_);
+    if (processors.empty()) {
         return handle_error(-1, "Failed to create filter instance");
     }
+    std::unique_ptr<processors::Processor> processor = std::move(processors[0]);
 
     // Initialize output dimensions based on filter configuration
     int output_width = 0, output_height = 0;
@@ -117,8 +117,19 @@ int VideoProcessor::process(
         return handle_error(ret, "Failed to initialize filter");
     }
 
+    std::unique_ptr<processors::Processor> processor_rife;
+    if (processors.size() > 1) {
+        processor_rife = std::move(processors[1]);
+
+        // Initialize the Interpolator
+        ret = processor_rife->init(dec_ctx, encoder.get_encoder_context(), hw_ctx.get());
+        if (ret < 0) {
+            return handle_error(ret, "Failed to initialize Interpolator");
+        }
+    }
+
     // Process frames using the encoder and decoder
-    ret = process_frames(decoder, encoder, processor);
+    ret = process_frames(decoder, encoder, processor, processor_rife);
     if (ret < 0) {
         return handle_error(ret, "Error processing frames");
     }
@@ -143,7 +154,8 @@ int VideoProcessor::process(
 int VideoProcessor::process_frames(
     decoder::Decoder& decoder,
     encoder::Encoder& encoder,
-    std::unique_ptr<processors::Processor>& processor
+    std::unique_ptr<processors::Processor>& processor,
+    std::unique_ptr<processors::Processor>& processor_rife
 ) {
     char errbuf[AV_ERROR_MAX_STRING_SIZE];
     int ret = 0;
@@ -196,11 +208,24 @@ int VideoProcessor::process_frames(
         total_frames_.store(total_frames_.load() * proc_cfg_.frm_rate_mul);
     }
 
+    std::vector<std::unique_ptr<AVFrame, decltype(&avutils::av_frame_deleter)>> frames;
+    frames.reserve(10);
+
     // Read frames from the input file
     while (state_.load() != VideoProcessorState::Aborted) {
         ret = av_read_frame(ifmt_ctx, packet.get());
         if (ret < 0) {
             if (ret == AVERROR_EOF) {
+                // If there are remaining frames in batch, process them
+                if (!frames.empty()) {
+                    logger()->debug("Processing remaining {} frames before exiting", frames.size());
+                    AVFrame* proc_frame = nullptr;
+                    ret = process_filtering(processor, encoder, frames, proc_frame);
+                    if (ret < 0) {
+                        return ret;
+                    }
+                    frames.clear();
+                }
                 logger()->debug("Reached end of file");
                 break;
             }
@@ -245,7 +270,28 @@ int VideoProcessor::process_frames(
                 AVFrame* proc_frame = nullptr;
                 switch (processor->get_processing_mode()) {
                     case processors::ProcessingMode::Filter: {
-                        ret = process_filtering(processor, encoder, frame.get(), proc_frame);
+                        // When executing the Filter, if a RIFE processor exists, it indicates that the upscale process should be performed using the skip-frame interpolation method.
+                        frames.emplace_back(av_frame_clone(frame.get()), &avutils::av_frame_deleter);
+                        if (processor_rife) {
+                            if (frames.size() < proc_cfg_.upscale_skip_interval + 2) {
+                                // Here, the frame is emplaced back into frames. To ensure the correct calculation of frame->pts, the frame_idx_ value needs to be fetch_add.
+                                // This value will be subtracted later during processing and will only be officially fetch_add again after write_frame.
+                                frame_idx_.fetch_add(1);
+                                continue;
+                            }
+                            ret = process_filter_interpolate(processor, processor_rife, encoder, frames);
+                        } else {
+                            if (proc_cfg_.frames_per_merge > 1) {
+                                if (frames.size() < proc_cfg_.frames_per_merge) {
+                                    // Here, the frame is emplaced back into frames. To ensure the correct calculation of frame->pts, the frame_idx_ value needs to be fetch_add.
+                                    // This value will be subtracted later during processing and will only be officially fetch_add again after write_frame.
+                                    frame_idx_.fetch_add(1);
+                                    continue;
+                                }
+                            }
+                            ret = process_filtering(processor, encoder, frames, proc_frame);
+                        }
+                        frames.clear();
                         break;
                     }
                     case processors::ProcessingMode::Interpolate: {
@@ -350,28 +396,64 @@ int VideoProcessor::write_raw_packet(
 int VideoProcessor::process_filtering(
     std::unique_ptr<processors::Processor>& processor,
     encoder::Encoder& encoder,
-    AVFrame* frame,
+    std::vector<std::unique_ptr<AVFrame, decltype(&avutils::av_frame_deleter)>>& frames,
     AVFrame* proc_frame
 ) {
     char errbuf[AV_ERROR_MAX_STRING_SIZE];
     int ret = 0;
+    int batch_size = frames.size();
 
     // Cast the processor to a Filter
     processors::Filter* filter = static_cast<processors::Filter*>(processor.get());
+    
+    // Previously, when emplacing the frame into frames, frame_idx_ was temporarily fetch-added to ensure the correctness of frame->pts. Now, it is decremented.
+    frame_idx_.fetch_sub(frames.size() < proc_cfg_.frames_per_merge ? frames.size() : frames.size() - 1);
 
-    // Process the frame using the filter
-    ret = filter->filter(frame, &proc_frame);
-
-    // Write the processed frame
-    if (ret < 0 && ret != AVERROR(EAGAIN)) {
-        av_strerror(ret, errbuf, sizeof(errbuf));
-        logger()->critical("Error filtering frame: {}", errbuf);
-    } else if (ret == 0 && proc_frame != nullptr) {
-        auto processed_frame = std::unique_ptr<AVFrame, decltype(&avutils::av_frame_deleter)>(
-            proc_frame, &avutils::av_frame_deleter
-        );
-        ret = write_frame(processed_frame.get(), encoder);
+    // Create storage for processed frames
+    std::vector<std::unique_ptr<AVFrame, decltype(&avutils::av_frame_deleter)>> proc_frames;
+    proc_frames.reserve(frames.size());
+    for (int i = 0; i < frames.size(); i++) {
+        proc_frames.emplace_back(nullptr, avutils::av_frame_deleter);
     }
+
+    auto [merged_frames, last_group_size] = merge_frames(frames, frames.size());
+    if (!merged_frames.empty()) {
+        for (int i = 0; i < merged_frames.size(); i++) {
+            AVFrame* raw_proc_frame = nullptr;
+            // Apply the filter to the frame
+            ret = filter->filter(merged_frames[i].get(), &raw_proc_frame);
+            if (ret < 0 && ret != AVERROR(EAGAIN)) {
+                av_strerror(ret, errbuf, sizeof(errbuf));
+                logger()->critical("Error filtering frame: {}", errbuf);
+                return ret;
+            }
+            if (raw_proc_frame) {
+                int parts = (i == merged_frames.size() - 1 && last_group_size > 0) ? last_group_size : batch_size;
+                auto split_result = split_frame(raw_proc_frame, parts);
+                if (!split_result.empty()) {
+                    for (int j = 0; j < split_result.size(); j++) {
+                        proc_frames[j + (i * batch_size)].reset(av_frame_clone(split_result[j].get()));
+                        proc_frames[j + (i * batch_size)]->pts = frames[j + (i * batch_size)]->pts;  // Maintain original PTS
+                    }
+                }
+                // Free raw_proc_frame
+                av_frame_free(&raw_proc_frame);
+            }
+        }
+    }
+    // Write frames
+    for (int i = 0; i < proc_frames.size(); i++) {
+        if (proc_frames[i]) {
+            ret = write_frame(proc_frames[i].get(), encoder);
+            if (ret < 0) {
+                return ret;
+            }
+            if (i < proc_frames.size() - 1) {
+                frame_idx_.fetch_add(1);
+            }
+        }
+    }
+
     return ret;
 }
 
@@ -448,5 +530,238 @@ int VideoProcessor::process_interpolation(
     prev_frame.reset(av_frame_clone(frame));
     return ret;
 }
+
+int VideoProcessor::process_filter_interpolate(
+    std::unique_ptr<processors::Processor>& processor,
+    std::unique_ptr<processors::Processor>& processor_rife,
+    encoder::Encoder& encoder,
+    std::vector<std::unique_ptr<AVFrame, decltype(&avutils::av_frame_deleter)>>& frames
+) {
+    char errbuf[AV_ERROR_MAX_STRING_SIZE];
+    int ret = 0;
+    int frame_count = proc_cfg_.upscale_skip_interval + 2;
+
+    processors::Filter* filter = static_cast<processors::Filter*>(processor.get());
+    processors::Interpolator* interpolator = static_cast<processors::Interpolator*>(processor_rife.get());
+
+    if (frames.size() < frame_count) {
+        logger()->critical("Not enough frames for processing, frames.size(): {}, frame_count: {}", frames.size(), frame_count);
+        return -1;
+    }
+
+    // Previously, when emplacing the frame into frames, frame_idx_ was temporarily fetch-added to ensure the correctness of frame->pts. Now, it is decremented.
+    frame_idx_.fetch_sub(frame_count - 1);
+
+
+    // Check for scene change
+    bool scene_change = false;
+    if (proc_cfg_.scn_det_thresh < 100.0) {
+        float frame_diff = avutils::get_frame_diff(frames.front().get(), frames.back().get());
+        if (frame_diff > proc_cfg_.scn_det_thresh) {
+            logger()->debug("Scene change detected ({:.2f}%)", frame_diff);
+            scene_change = true;
+        }
+    }
+
+    // Create storage for processed frames
+    std::vector<std::unique_ptr<AVFrame, decltype(&avutils::av_frame_deleter)>> proc_frames;
+    proc_frames.reserve(frame_count);
+    for (int i = 0; i < frame_count; i++) {
+        proc_frames.emplace_back(nullptr, avutils::av_frame_deleter);
+    }
+
+    int batch_size = proc_cfg_.frames_per_merge > 1 ? proc_cfg_.frames_per_merge : 1;
+    if (scene_change) {
+        auto [merged_frames, last_group_size] = merge_frames(frames, batch_size);
+        if (!merged_frames.empty()) {
+            for (int i = 0; i < merged_frames.size(); i++) {
+                AVFrame* raw_proc_frame = nullptr;
+                // Apply the filter to the frame
+                ret = filter->filter(merged_frames[i].get(), &raw_proc_frame);
+                if (ret < 0 && ret != AVERROR(EAGAIN)) {
+                    av_strerror(ret, errbuf, sizeof(errbuf));
+                    logger()->critical("Error filtering frame: {}", errbuf);
+                    return ret;
+                }
+                if (raw_proc_frame) {
+                    int parts = (i == merged_frames.size() - 1 && last_group_size > 0) ? last_group_size : batch_size;
+                    auto split_result = split_frame(raw_proc_frame, parts);
+                    if (!split_result.empty()) {
+                        for (int j = 0; j < split_result.size(); j++) {
+                            proc_frames[j + (i * batch_size)].reset(av_frame_clone(split_result[j].get()));
+                            proc_frames[j + (i * batch_size)]->pts = frames[j + (i * batch_size)]->pts;  // Maintain original PTS
+                        }
+                    }
+                    // Free raw_proc_frame
+                    av_frame_free(&raw_proc_frame);
+                }
+            }
+        }
+    } else {
+        std::vector<std::unique_ptr<AVFrame, decltype(&avutils::av_frame_deleter)>> temp;
+        temp.push_back(std::unique_ptr<AVFrame, decltype(&avutils::av_frame_deleter)>(av_frame_clone(frames.front().get()), avutils::av_frame_deleter));
+        temp.push_back(std::unique_ptr<AVFrame, decltype(&avutils::av_frame_deleter)>(av_frame_clone(frames.back().get()), avutils::av_frame_deleter));
+
+        auto [merged_frames, last_group_size] = merge_frames(temp, 2);
+        if (!merged_frames.empty()) {
+            AVFrame* raw_proc_frame = nullptr;
+            // Apply the filter to the frame
+            ret = filter->filter(merged_frames[0].get(), &raw_proc_frame);
+            if (ret < 0 && ret != AVERROR(EAGAIN)) {
+                av_strerror(ret, errbuf, sizeof(errbuf));
+                logger()->critical("Error filtering frame: {}", errbuf);
+                return ret;
+            }
+            if (raw_proc_frame) {
+                auto split_result = split_frame(raw_proc_frame, 2);
+                if (!split_result.empty()) {
+                    proc_frames.front().reset(av_frame_clone(split_result.front().get()));
+                    proc_frames.front()->pts = frames.front()->pts;  // Maintain original PTS
+                    proc_frames.back().reset(av_frame_clone(split_result.back().get()));
+                    proc_frames.back()->pts = frames.back()->pts;  // Maintain original PTS
+                }
+                // Free raw_proc_frame
+                av_frame_free(&raw_proc_frame);
+            }
+        }
+
+        // Interpolate intermediate frames if no scene change
+        float time_step = 1.0f / static_cast<float>(frame_count - 1);
+        for (int i = 1; i < frame_count - 1; i++) {
+            float interp_step = time_step * i;
+            AVFrame* raw_interp_frame = nullptr;  // Temporary pointer for the interpolated frame
+
+            // Perform interpolation
+            ret = interpolator->interpolate(
+                proc_frames.front().get(),  // First filtered frame
+                proc_frames.back().get(),   // Last filtered frame
+                &raw_interp_frame,          // Store the interpolated frame in a raw pointer
+                interp_step
+            );
+
+            if (ret < 0) {
+                av_strerror(ret, errbuf, sizeof(errbuf));
+                logger()->critical("Error interpolating frame: {}", errbuf);
+                return ret;
+            }
+
+            if (raw_interp_frame) {
+                proc_frames[i].reset(raw_interp_frame);
+                proc_frames[i]->pts = frames[i]->pts;
+            }
+        }
+    }
+
+    // Write frames
+    for (int i = 0; i < proc_frames.size(); i++) {
+        if (proc_frames[i]) {
+            ret = write_frame(proc_frames[i].get(), encoder);
+            if (ret < 0) {
+                return ret;
+            }
+            if (i < proc_frames.size() - 1)
+                frame_idx_.fetch_add(1);
+        }
+    }
+
+    return ret;
+}
+
+
+std::pair<std::vector<std::unique_ptr<AVFrame, decltype(&avutils::av_frame_deleter)>>, int> 
+VideoProcessor::merge_frames(const std::vector<std::unique_ptr<AVFrame, decltype(&avutils::av_frame_deleter)>>& frames, int merge_count) 
+{
+    std::vector<std::unique_ptr<AVFrame, decltype(&avutils::av_frame_deleter)>> merged_frames;
+    int last_group_size = 0;
+
+    if (frames.empty() || merge_count <= 0) return {std::move(merged_frames), 0};
+
+    int frame_width = frames[0]->width;
+    int frame_height = frames[0]->height;
+    AVPixelFormat format = static_cast<AVPixelFormat>(frames[0]->format);
+
+    for (size_t i = 0; i < frames.size(); i += merge_count) {
+        int group_size = std::min(merge_count, static_cast<int>(frames.size() - i));
+        last_group_size = group_size;
+
+        // Create a new frame with a width multiplied by group_size
+        AVFrame* new_frame = av_frame_alloc();
+        new_frame->width = frame_width * group_size;
+        new_frame->height = frame_height;
+        new_frame->format = format;
+        new_frame->color_range = frames[i]->color_range;
+        new_frame->colorspace = frames[i]->colorspace;
+
+        av_frame_get_buffer(new_frame, 32);
+        av_frame_make_writable(new_frame);
+
+        // Merge Y/U/V channels
+        for (int y = 0; y < frame_height; y++) {
+            for (int j = 0; j < group_size; j++) {
+                memcpy(new_frame->data[0] + y * new_frame->linesize[0] + j * frame_width,
+                       frames[i + j]->data[0] + y * frames[i + j]->linesize[0], frame_width);
+            }
+        }
+
+        int chroma_height = (format == AV_PIX_FMT_YUV420P) ? frame_height / 2 : frame_height;
+        for (int y = 0; y < chroma_height; y++) {
+            for (int j = 0; j < group_size; j++) {
+                memcpy(new_frame->data[1] + y * new_frame->linesize[1] + j * (frame_width / 2),
+                       frames[i + j]->data[1] + y * frames[i + j]->linesize[1], frame_width / 2);
+                memcpy(new_frame->data[2] + y * new_frame->linesize[2] + j * (frame_width / 2),
+                       frames[i + j]->data[2] + y * frames[i + j]->linesize[2], frame_width / 2);
+            }
+        }
+        // Use std::move to avoid copying unique_ptr
+        merged_frames.emplace_back(std::move(std::unique_ptr<AVFrame, decltype(&avutils::av_frame_deleter)>(new_frame, avutils::av_frame_deleter)));
+    }
+
+    return {std::move(merged_frames), last_group_size};
+}
+
+std::vector<std::unique_ptr<AVFrame, decltype(&avutils::av_frame_deleter)>> 
+VideoProcessor::split_frame(AVFrame* frame, int split_count) 
+{
+    std::vector<std::unique_ptr<AVFrame, decltype(&avutils::av_frame_deleter)>> split_frames;
+
+    if (!frame || split_count <= 0) return split_frames;
+
+    int new_width = frame->width / split_count;
+    int height = frame->height;
+    AVPixelFormat format = static_cast<AVPixelFormat>(frame->format);
+
+    for (int j = 0; j < split_count; j++) {
+        AVFrame* new_frame = av_frame_alloc();
+        new_frame->width = new_width;
+        new_frame->height = height;
+        new_frame->format = format;
+        new_frame->color_range = frame->color_range;
+        new_frame->colorspace = frame->colorspace;
+
+        av_frame_get_buffer(new_frame, 32);
+        av_frame_make_writable(new_frame);
+
+        // Split Y channel
+        for (int y = 0; y < height; y++) {
+            memcpy(new_frame->data[0] + y * new_frame->linesize[0],
+                   frame->data[0] + y * frame->linesize[0] + j * new_width, new_width);
+        }
+
+        // Split U/V channels
+        int chroma_height = (format == AV_PIX_FMT_YUV420P) ? height / 2 : height;
+        for (int y = 0; y < chroma_height; y++) {
+            memcpy(new_frame->data[1] + y * new_frame->linesize[1],
+                   frame->data[1] + y * frame->linesize[1] + j * (new_width / 2), new_width / 2);
+            memcpy(new_frame->data[2] + y * new_frame->linesize[2],
+                   frame->data[2] + y * frame->linesize[2] + j * (new_width / 2), new_width / 2);
+        }
+
+        // Use std::move to avoid copying unique_ptr
+        split_frames.emplace_back(std::move(std::unique_ptr<AVFrame, decltype(&avutils::av_frame_deleter)>(new_frame, avutils::av_frame_deleter)));
+    }
+
+    return split_frames;
+}
+
 
 }  // namespace video2x

@@ -137,6 +137,10 @@ int parse_args(
                 ->notifier([](int v) { validate_min(v, "scaling-factor", 1); }), "Scaling factor")
             ("noise-level,n", po::value<int>(&proc_cfg.noise_level)
                 ->notifier([](int v) { validate_min(v, "noise-level", 0); }), "Noise level")
+            ("frames-per-merge,x", po::value<int>(&proc_cfg.frames_per_merge)
+                ->notifier([](int v) { validate_min(v, "frames-per-merge", 2); }), "Set the frames-per-merge size for upscale. This option is used to speed up video upscaling. When the value is greater than 1, the specified number of input frames will be combined into a single image for processing. After upscaling, the image will be split back into multiple frames.")
+            ("upscale-skip-interval,k", po::value<int>(&proc_cfg.upscale_skip_interval)
+                ->notifier([](int v) { validate_min(v, "upscale-skip-interval", 1); }), "Set the upscale filter skip interval. This option is used to speed up video upscaling by specifying the number of frames to skip for each filtered frame.")
         ;
 
         po::options_description interp_opts("Frame interpolation options");
@@ -163,8 +167,7 @@ int parse_args(
             ("realesrgan-model", PO_STR_VALUE<video2x::fsutils::StringType>()
                 ->default_value(STR("realesr-animevideov3"), "realesr-animevideov3")
                 ->notifier(validate_realesrgan_model_name),
-                "Name of the Real-ESRGAN model to use (realesr-animevideov3, "
-                "realesrgan-plus-anime, realesrgan-plus, realesr-generalv3)")
+                "Name of the Real-ESRGAN model to use (must start with \"realesr\", case insensitive).")
         ;
 
         po::options_description realcugan_opts("Real-CUGAN options");
@@ -222,7 +225,13 @@ int parse_args(
                 << std::endl
                 << "  Frame-interpolate a video using RIFE to 4x the original frame rate:"
                 << std::endl
-                << "    video2x -i input.mp4 -o output.mp4 -m 4 -p rife --rife-model rife-v4.6"
+                << "    video2x -i input.mp4 -o output.mp4 -m 4 -p rife --rife-model rife-v4.6" << std::endl
+                << std::endl
+                << "  Upscale a video by 4x using Real-ESRGAN general with upscale-skip-interval options:"
+                << std::endl
+                << "    video2x -i input.mp4 -o output.mp4 -s 4 \\" << std::endl
+                << "      -p realesrgan --realesrgan-model realesr-generalv3 \\" << std::endl
+                << "      -k 1 --rife-model rife-v4.6 -c libx265 -e crf=26" << std::endl
                 << std::endl;
             return 1;
         }
@@ -272,6 +281,9 @@ int parse_args(
                 std::filesystem::path(vm["output"].as<video2x::fsutils::StringType>());
         } else {
             arguments.out_fname = arguments.in_fname.filename();  // Extract file name only
+            //if (arguments.out_fname.extension() == ".avi") {
+            //    arguments.out_fname.replace_extension(".mp4");  // Change the extension to ".mp4"
+            //}
         }
 
         if (vm.count("suffix")) {
@@ -393,7 +405,17 @@ int parse_args(
                 video2x::processors::LibplaceboConfig libplacebo_config;
                 libplacebo_config.shader_path =
                     vm["libplacebo-shader"].as<video2x::fsutils::StringType>();
-                proc_cfg.config = libplacebo_config;
+                if (proc_cfg.upscale_skip_interval < 1) {
+                    proc_cfg.config = libplacebo_config;
+                } else {
+                    video2x::processors::RIFEConfig rife_config;
+                    rife_config.tta_mode = false;
+                    rife_config.tta_temporal_mode = false;
+                    rife_config.uhd_mode = vm.count("rife-uhd") > 0;
+                    rife_config.num_threads = 0;
+                    rife_config.model_name = vm["rife-model"].as<video2x::fsutils::StringType>();
+                    proc_cfg.config = std::make_pair(libplacebo_config, rife_config);
+                }
                 break;
             }
             case video2x::processors::ProcessorType::RealESRGAN: {
@@ -417,7 +439,17 @@ int parse_args(
                 realesrgan_config.tta_mode = false;
                 realesrgan_config.model_name =
                     vm["realesrgan-model"].as<video2x::fsutils::StringType>();
-                proc_cfg.config = realesrgan_config;
+                if (proc_cfg.upscale_skip_interval < 1) {
+                    proc_cfg.config = realesrgan_config;
+                } else {
+                    video2x::processors::RIFEConfig rife_config;
+                    rife_config.tta_mode = false;
+                    rife_config.tta_temporal_mode = false;
+                    rife_config.uhd_mode = vm.count("rife-uhd") > 0;
+                    rife_config.num_threads = 0;
+                    rife_config.model_name = vm["rife-model"].as<video2x::fsutils::StringType>();
+                    proc_cfg.config = std::make_pair(realesrgan_config, rife_config);
+                }
                 break;
             }
             case video2x::processors::ProcessorType::RealCUGAN: {
@@ -458,7 +490,17 @@ int parse_args(
                     vm["realcugan-model"].as<video2x::fsutils::StringType>();
                 realcugan_config.num_threads = vm["realcugan-threads"].as<int>();
                 realcugan_config.syncgap = vm["realcugan-syncgap"].as<int>();
-                proc_cfg.config = realcugan_config;
+                if (proc_cfg.upscale_skip_interval < 1) {
+                    proc_cfg.config = realcugan_config;
+                } else {
+                    video2x::processors::RIFEConfig rife_config;
+                    rife_config.tta_mode = false;
+                    rife_config.tta_temporal_mode = false;
+                    rife_config.uhd_mode = vm.count("rife-uhd") > 0;
+                    rife_config.num_threads = 0;
+                    rife_config.model_name = vm["rife-model"].as<video2x::fsutils::StringType>();
+                    proc_cfg.config = std::make_pair(realcugan_config, rife_config);
+                }
                 break;
             }
             case video2x::processors::ProcessorType::RIFE: {

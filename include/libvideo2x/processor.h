@@ -2,6 +2,7 @@
 
 #include <variant>
 #include <vector>
+#include <utility>  // for std::pair
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -59,8 +60,11 @@ struct ProcessorConfig {
     int scaling_factor = 0;
     int noise_level = -1;
     int frm_rate_mul = 0;
+    int frames_per_merge = 0;
+    int upscale_skip_interval = 0;
     float scn_det_thresh = 0.0f;
-    std::variant<LibplaceboConfig, RealESRGANConfig, RealCUGANConfig, RIFEConfig> config;
+    std::variant<LibplaceboConfig, RealESRGANConfig, RealCUGANConfig, RIFEConfig,
+        std::pair<LibplaceboConfig, RIFEConfig>, std::pair<RealESRGANConfig, RIFEConfig>, std::pair<RealCUGANConfig, RIFEConfig>> config;
 };
 
 class Processor {
