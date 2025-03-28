@@ -27,21 +27,35 @@ Version 6.0.0 is a complete rewrite of this project in C/C++. It:
 - genuinely works this time, with much less hassle compared to the 5.0.0 beta;
 - is blazing fast, thanks to the new optimized pipeline and the efficiency of C/C++;
 - is cross-platform, available now for both Windows and Linux;
-- offers significantly better output quality with Anime4K v4, RealESRGAN, RealCUGAN, and RIFE;
+- offers significantly better output quality with Anime4K v4, Real-ESRGAN, Real-CUGAN, and RIFE;
 - supports two modes: filtering (upscaling) and frame interpolation;
 - supports Anime4K v4 and all custom MPV-compatible GLSL shaders;
-- supports RealESRGAN, RealCUGAN, and RIFE (all models) via ncnn and Vulkan;
+- supports Real-ESRGAN, Real-CUGAN, and RIFE (all models) via ncnn and Vulkan;
 - requires zero additional disk space during processing, just space for the final output.
 
 </details>
 
 ![6.4.0-screenshot](https://github.com/user-attachments/assets/9b1cc8a7-2903-4d2c-80a2-8d81f007e45b)
 
+## 🖥️ Hardware Requirements
+
+Your system must meet the minimum hardware requirements below to run Video2X.
+
+- **CPU**
+  - The precompiled binaries require CPUs with AVX2 support.
+  - **Intel**: Haswell (Q2 2013) or newer
+  - **AMD**: Excavator (Q2 2015) or newer
+- **GPU**
+  - The GPU must support Vulkan.
+  - **NVIDIA**: Kepler (GTX 600 series, Q2 2012) or newer
+  - **AMD**: GCN 1.0 (Radeon HD 7000 series, Q1 2012) or newer
+  - **Intel**: HD Graphics 4000 (Q2 2012) or newer
+
 ## [🪟 Install on Windows](https://docs.video2x.org/installing/windows-qt6.html)
 
 **[Download the Latest Windows Installer Executable (6.4.0)](https://github.com/k4yt3x/video2x/releases/download/6.4.0/video2x-qt6-windows-amd64-installer.exe)**
 
-You can download the latest Windows release on the [releases page](https://github.com/k4yt3x/video2x/releases/latest). For basic GUI usage, refer to the [documentation](https://docs.video2x.org/running/desktop.html). If you're unable to download directly from GitHub, try the [mirror site](https://files.k4yt3x.com/Projects/Video2X). The GUI currently supports the following languages:
+You can download the latest Windows release on the [releases page](https://github.com/k4yt3x/video2x/releases/latest). For basic GUI usage, refer to the [documentation](https://docs.video2x.org/running/desktop.html). If you're unable to download directly from GitHub, try the [mirror site](https://files.k4yt3x.com). The GUI currently supports the following languages:
 
 - English (United States)
 - 简体中文（中国）
@@ -101,11 +115,11 @@ _Upscale demo: Spirited Away's movie trailer_
 
 The following clip can be used to test if your setup works properly. This is also the standard clip used for running performance benchmarks.
 
-- [Standard Test Clip (240P)](https://files.k4yt3x.com/Resources/Videos/standard-test.mp4) 4.54 MiB
-- [Real-CUGAN Upscaled Sample (1704P)](https://files.k4yt3x.com/Resources/Videos/standard-realcugan.mp4) 3.5 MiB
-- [Real-ESRGAN Upscaled Sample (1704P)](https://files.k4yt3x.com/Resources/Videos/standard-realesrgan.mp4) 3.1 MiB
-- [waifu2x Upscaled Sample (1080P)](https://files.k4yt3x.com/Resources/Videos/standard-waifu2x.mp4) 4.54 MiB
-- [Ground Truth (1080P)](https://files.k4yt3x.com/Resources/Videos/standard-original.mp4) 22.2 MiB
+- [Standard Test Clip (240P)](https://files.k4yt3x.com/resources/videos/standard-test.mp4) 4.54 MiB
+- [Real-CUGAN Upscaled Sample (1704P)](https://files.k4yt3x.com/resources/videos/standard-realcugan.mp4) 3.5 MiB
+- [Real-ESRGAN Upscaled Sample (1704P)](https://files.k4yt3x.com/resources/videos/standard-realesrgan.mp4) 3.1 MiB
+- [waifu2x Upscaled Sample (1080P)](https://files.k4yt3x.com/resources/videos/standard-waifu2x.mp4) 4.54 MiB
+- [Ground Truth (1080P)](https://files.k4yt3x.com/resources/videos/standard-original.mp4) 22.2 MiB
 
 The original clip came from the anime "さくら荘のペットな彼女."\
 Copyright of this clip belongs to 株式会社アニプレックス.
